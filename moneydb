@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import sqlite3
+import collections
+from datetime import date
+from bs4 import BeautifulSoup
+
+class Database:
+    # TODO: make sure database code can handle multiple concurrent
+    # connections/modifications
+
+    def __init__(self):
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        self.conn = sqlite3.connect(os.path.join(script_dir, 'money.db'),
+                detect_types=sqlite3.PARSE_DECLTYPES)
+        with self.conn:
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY,
+                date DATE NOT NULL,
+                desc TEXT NOT NULL,
+                amount INTEGER NOT NULL)''')
+
+    def merge_transactions(self, transactions):
+        for transaction, count in collections.Counter(transactions).items():
+            with self.conn:
+                cursor = self.conn.execute('''
+                    SELECT COUNT(*) FROM transactions WHERE date=? AND desc=?
+                    AND amount=?''', (transaction.date, transaction.description,
+                        transaction.amount))
+                current_count = cursor.fetchone()[0]
+                del cursor
+
+                if current_count == 0:
+                    for _ in range(count):
+                        print('Inserting: {!r}'.format(transaction))
+                        self.conn.execute('''
+                            INSERT INTO transactions (date, desc, amount)
+                            VALUES (?, ?, ?)''', (transaction.date,
+                                transaction.description, transaction.amount))
+                else:
+                    if current_count != count:
+                        print(repr(transaction))
+                        print('New Count: {}\nCurrent Count: {}'.format(
+                            count, current_count))
+                        sys.exit('Error: transaction copies don\'t match')
+
+
+    # def transactions(self):
+    #     with self.conn:
+    #         for row in self.conn.execute('''
+    #             SELECT 
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit('Error: specify html file')
+
+    db = Database()
+
+    mbna_transactions = parse_transactions(sys.argv[1], encoding='Windows-1252',
+            transaction_func=parse_mbna_transaction_row)
+
+    db.merge_transactions(mbna_transactions)
+
+    for transaction in mbna_transactions:
+        print('{}\t{:50}\t{:8}'.format(
+            transaction.date,
+            transaction.description,
+            format_cents(transaction.amount)))
+
+def parse_transactions(filename, encoding, transaction_func):
+    with open(filename, encoding=encoding) as f:
+        tree = BeautifulSoup(f)
+
+    transactions = []
+    for tag in tree.find_all():
+        transaction = transaction_func(tag)
+        if transaction != None:
+            transactions.append(transaction)
+
+    return transactions
+
+def parse_mbna_transaction_row(tag):
+    if tag.name != 'tr':
+        return None
+
+    # check table headers
+    headers = [re.sub(r'\s+', ' ', ' '.join(h.strings)).strip()
+        for h in tag.parent.tr.find_all(['th', 'td'])]
+    if not (len(headers) >= 6 and
+            headers[0] == 'Transaction Date' and
+            headers[1] == 'Posting Date' and
+            headers[2] == 'Description' and
+            headers[4] == 'Reference Number' and
+            headers[5] == 'Amount'):
+        return None
+
+    # get field data
+    fields = [re.sub(r'\s+', ' ', ' '.join(h.strings)).strip()
+        for h in tag.find_all(['th', 'td'])]
+
+    def parse_date(s):
+        m = re.match(r'^(\d\d)/(\d\d)/(\d\d\d\d)$', s)
+        if m != None:
+            month = int(m.group(1))
+            day = int(m.group(2))
+            year = int(m.group(3))
+            return date(year, month, day)
+        return None
+
+    def parse_amount(s):
+        m = re.match(r'^(-?)\$([\d,]+)\.(\d\d)$', s)
+        if m != None:
+            amount = (int(m.group(2).replace(',',''))*100 +
+                int(m.group(3)))
+            if m.group(1) == '-':
+                amount = -amount
+            return amount
+        return None
+
+    if len(fields) < 6:
+        return None
+
+    transaction_date = parse_date(fields[0])
+    posting_date = parse_date(fields[1])
+    description = fields[2] if fields[2] != '' else None
+    reference_num = int(fields[4]) if fields[4].isdigit() else None
+    amount = parse_amount(fields[5])
+
+    if any(f == None for f in (transaction_date, posting_date, description,
+            reference_num, amount)):
+        return None
+
+    return Transaction(
+            date = transaction_date,
+            description = description,
+            amount = amount)
+
+def format_cents(c):
+    minus = '-' if c < 0 else ''
+    return '{}${:,}.{:02}'.format(minus, abs(c)//100, abs(c)%100)
+
+class Transaction:
+    def __init__(self, date, description, amount):
+        self.date = date
+        self.description = description
+        self.amount = amount
+
+    def __repr__(self):
+        return ('Transaction(date={!r}, description={!r}, amount={!r})').format(
+                self.date, self.description, self.amount)
+
+if __name__ == '__main__':
+    main()
